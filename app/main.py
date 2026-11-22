@@ -13,6 +13,22 @@
 - 标准误   = sqrt(Σ 空白方差 × 该空白总使用次数² + 独立测量方差之和) / 测量总数
 - 查询旧汇总时返回原结果与当时采用的空白样数据（快照）。
 - 资料缺失（样组号 / 汇总号 / 空白样）时列出所缺编号，本次不生成汇总。
+
+检出限复核
+----------
+旧汇总的读数合计可能把未检出读数代填为检出限，导致校正均值偏高。复核流程：
+- 实验室按样组整批补录/更正（覆盖式替换）：未经空白扣减的检出读数之和，
+  以及按空白样号 + 检出限登记的未检出次数；零未检出也须明确填报。
+  同一空白样下的未检出次数合计不得超过该样组对该空白样的原使用次数；
+  一组有误则整批不生效（原子提交）。
+- 复核请求提交历史汇总号与同单位浓度限值。沿用该汇总留档的空白扣减快照，
+  未检出读数按零至各自检出限计，求校正均值的上下界：
+    下界 = (Σ 检出读数之和 + 0 − 空白扣减合计) / 测量总数
+    上界 = (Σ 检出读数之和 + Σ 未检出次数×检出限 − 空白扣减合计) / 测量总数
+- 判定：下界高于限值 → 超限；上界不高于限值 → 未超限；其余 → 无法判定。
+- 缺少补录时列出样组，本次不生成复核记录。
+- 复核以开始核算时已生效的补录为准（事务内快照），核算期间仍可完成整批更正，
+  更正不影响已生成的复核记录。凭复核号查回原上下界、判定与核算依据。
 """
 from __future__ import annotations
 
@@ -24,7 +40,13 @@ from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException
-from pydantic import BaseModel, Field, PositiveInt, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    NonNegativeInt,
+    PositiveInt,
+    model_validator,
+)
 
 from .db import connect, init_db
 
@@ -76,6 +98,39 @@ class SummaryRequest(BaseModel):
         return self
 
 
+# ---------------------------------------------------------------- 检出限复核模型
+
+class NonDetectEntry(BaseModel):
+    """同一空白样、同一检出限下的未检出次数（零次也须明确填报）。"""
+
+    blank_id: str = Field(min_length=1, description="空白样编号")
+    detection_limit: float = Field(gt=0, description="检出限（必须为正）")
+    count: NonNegativeInt = Field(description="未检出次数，零未检出也须明确填报为 0")
+
+
+class SupplementItem(BaseModel):
+    """单个样组的检出限补录内容。"""
+
+    group_id: str = Field(min_length=1, description="样组唯一编号")
+    detected_reading_sum: float = Field(description="未经空白扣减的检出读数之和")
+    non_detects: list[NonDetectEntry] = Field(
+        min_length=1, description="按空白样号和检出限填未检出次数；须覆盖该样组全部空白样"
+    )
+
+
+class SupplementBatchRequest(BaseModel):
+    """整批补录 / 更正：一组有误则整批不生效。"""
+
+    supplements: list[SupplementItem] = Field(min_length=1, description="本批补录的样组列表")
+
+
+class ReviewRequest(BaseModel):
+    """发起检出限复核：历史汇总号 + 同单位浓度限值。"""
+
+    summary_id: int = Field(description="历史汇总号")
+    concentration_limit: float = Field(description="与汇总同单位的浓度限值")
+
+
 # ---------------------------------------------------------------- 应用初始化
 
 @asynccontextmanager
@@ -86,8 +141,8 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="浓度汇总 API",
-    version="1.0.0",
-    description="河段水质报告浓度汇总：样组登记、空白样登记/更正、汇总生成与查询。",
+    version="1.1.0",
+    description="河段水质报告浓度汇总：样组登记、空白样登记/更正、汇总生成与查询、检出限补录与复核。",
     lifespan=lifespan,
 )
 
@@ -190,6 +245,120 @@ def missing_data_error(**missing: list) -> HTTPException:
             "error": "missing_data",
             "message": "资料缺失，本次不生成汇总。",
             "missing": {k: v for k, v in missing.items() if v},
+        },
+    )
+
+
+# ---------------------------------------------------------------- 检出限复核辅助
+
+DETERMINATION_EXCEED = "exceed"                # 下界高于限值：超限
+DETERMINATION_NOT_EXCEED = "not_exceed"        # 上界不高于限值：未超限
+DETERMINATION_INDETERMINATE = "indeterminate"  # 其余：无法判定
+
+
+def supplement_payload(db: sqlite3.Connection, group_id: str, status: str | None = None) -> dict[str, Any] | None:
+    row = db.execute(
+        "SELECT * FROM dl_supplements WHERE group_id = ?", (group_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    non_detects = [
+        {
+            "blank_id": r["blank_id"],
+            "detection_limit": r["detection_limit"],
+            "count": r["nd_count"],
+        }
+        for r in db.execute(
+            "SELECT blank_id, detection_limit, nd_count "
+            "FROM dl_supplement_non_detects "
+            "WHERE group_id = ? ORDER BY blank_id, detection_limit",
+            (group_id,),
+        )
+    ]
+    payload = {
+        "group_id": row["group_id"],
+        "detected_reading_sum": row["detected_reading_sum"],
+        "non_detects": non_detects,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+    if status is not None:
+        payload["status"] = status
+    return payload
+
+
+def review_payload(db: sqlite3.Connection, review_id: int) -> dict[str, Any] | None:
+    row = db.execute(
+        "SELECT * FROM reviews WHERE review_id = ?", (review_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    groups = [
+        {
+            "group_id": r["group_id"],
+            "detected_reading_sum": r["detected_reading_sum"],
+            "non_detect_sum_low": r["non_detect_sum_low"],
+            "non_detect_sum_high": r["non_detect_sum_high"],
+            "non_detects": [
+                {
+                    "blank_id": nd["blank_id"],
+                    "detection_limit": nd["detection_limit"],
+                    "count": nd["nd_count"],
+                }
+                for nd in db.execute(
+                    "SELECT blank_id, detection_limit, nd_count "
+                    "FROM review_non_detects "
+                    "WHERE review_id = ? AND group_id = ? "
+                    "ORDER BY blank_id, detection_limit",
+                    (review_id, r["group_id"]),
+                )
+            ],
+        }
+        for r in db.execute(
+            "SELECT group_id, detected_reading_sum, non_detect_sum_low, non_detect_sum_high "
+            "FROM review_groups WHERE review_id = ? ORDER BY group_id",
+            (review_id,),
+        )
+    ]
+    blanks = [
+        {
+            "blank_id": r["blank_id"],
+            "usage_count": r["usage_count"],
+            "deduction": r["deduction"],
+        }
+        for r in db.execute(
+            "SELECT blank_id, usage_count, deduction "
+            "FROM review_blanks WHERE review_id = ? ORDER BY blank_id",
+            (review_id,),
+        )
+    ]
+    return {
+        "review_id": row["review_id"],
+        "summary_id": row["summary_id"],
+        "analyte": row["analyte"],
+        "unit": row["unit"],
+        "concentration_limit": row["concentration_limit"],
+        "total_measurements": row["total_measurements"],
+        "detected_reading_sum": row["detected_reading_sum"],
+        "non_detect_sum_low": row["non_detect_sum_low"],
+        "non_detect_sum_high": row["non_detect_sum_high"],
+        "blank_deduction_total": row["blank_deduction_total"],
+        "corrected_mean_lower": row["corrected_mean_lower"],
+        "corrected_mean_upper": row["corrected_mean_upper"],
+        "determination": row["determination"],
+        "groups": groups,
+        "blanks": blanks,
+        "created_at": row["created_at"],
+    }
+
+
+def supplement_validation_error(issues: list[dict[str, Any]]) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "error": "supplement_validation_failed",
+            "message": "补录校验未通过，整批不生效。",
+            "issues": issues,
         },
     )
 
@@ -463,3 +632,416 @@ def list_summaries(db: Db) -> list[dict[str, Any]]:
         for r in db.execute("SELECT summary_id FROM summaries ORDER BY summary_id")
     ]
     return [summary_payload(db, s) for s in ids]
+
+
+# ================================================================ 检出限补录
+
+@app.put(
+    "/detection-limit/supplements",
+    tags=["detection-limit"],
+    summary="整批补录 / 更正检出限数据（覆盖式替换，一组有误则整批不生效）",
+)
+def upsert_supplements(body: SupplementBatchRequest, db: Db) -> dict[str, Any]:
+    # 1) 同一批内样组号不得重复
+    seen: set[str] = set()
+    duplicated: list[str] = []
+    for item in body.supplements:
+        if item.group_id in seen and item.group_id not in duplicated:
+            duplicated.append(item.group_id)
+        seen.add(item.group_id)
+    if duplicated:
+        raise supplement_validation_error(
+            [
+                {
+                    "group_id": g,
+                    "reason": "duplicate_group_in_batch",
+                    "message": f"样组 {g} 在本批补录中重复出现。",
+                }
+                for g in duplicated
+            ]
+        )
+
+    # 2) 样组必须已登记；缺失则列出编号，本次不生效
+    missing_group_ids = [
+        item.group_id
+        for item in body.supplements
+        if db.execute(
+            "SELECT 1 FROM sample_groups WHERE group_id = ?", (item.group_id,)
+        ).fetchone()
+        is None
+    ]
+    if missing_group_ids:
+        raise missing_data_error(group_ids=missing_group_ids)
+
+    # 3) 逐样组校验（全部通过才写入，保证整批原子）
+    issues: list[dict[str, Any]] = []
+    for item in body.supplements:
+        usage = {
+            r["blank_id"]: r["usage_count"]
+            for r in db.execute(
+                "SELECT blank_id, usage_count FROM group_blank_usages WHERE group_id = ?",
+                (item.group_id,),
+            )
+        }
+
+        # 同一 (空白样, 检出限) 组合不得重复登记
+        key_seen: set[tuple[str, float]] = set()
+        duplicate_entries: list[dict[str, Any]] = []
+        for e in item.non_detects:
+            key = (e.blank_id, e.detection_limit)
+            if key in key_seen:
+                duplicate_entries.append(
+                    {"blank_id": e.blank_id, "detection_limit": e.detection_limit}
+                )
+            key_seen.add(key)
+        if duplicate_entries:
+            issues.append(
+                {
+                    "group_id": item.group_id,
+                    "reason": "duplicate_non_detect_entry",
+                    "message": "同一空白样与检出限的组合在该样组中重复填报。",
+                    "entries": duplicate_entries,
+                }
+            )
+
+        # 按空白样汇总未检出次数
+        nd_by_blank: dict[str, int] = {}
+        for e in item.non_detects:
+            nd_by_blank[e.blank_id] = nd_by_blank.get(e.blank_id, 0) + e.count
+
+        # 不得填报样组未使用的空白样
+        unknown_blanks = sorted(b for b in nd_by_blank if b not in usage)
+        if unknown_blanks:
+            issues.append(
+                {
+                    "group_id": item.group_id,
+                    "reason": "blank_not_used_by_group",
+                    "message": "填报了该样组未使用的空白样。",
+                    "blank_ids": unknown_blanks,
+                }
+            )
+
+        # 样组用到的每个空白样都须明确填报（零未检出也须填 0）
+        uncovered_blanks = sorted(set(usage) - set(nd_by_blank))
+        if uncovered_blanks:
+            issues.append(
+                {
+                    "group_id": item.group_id,
+                    "reason": "blank_missing_from_report",
+                    "message": "该样组使用的空白样未全部填报未检出次数（零未检出也须明确填报）。",
+                    "blank_ids": uncovered_blanks,
+                }
+            )
+
+        # 同一空白样下未检出次数合计不得超过原使用次数
+        exceeded = [
+            {
+                "blank_id": b,
+                "non_detect_count": nd_by_blank[b],
+                "usage_count": usage[b],
+            }
+            for b in sorted(nd_by_blank)
+            if b in usage and nd_by_blank[b] > usage[b]
+        ]
+        if exceeded:
+            issues.append(
+                {
+                    "group_id": item.group_id,
+                    "reason": "non_detect_count_exceeds_usage",
+                    "message": "同一空白样下的未检出次数合计超过该样组对它的原使用次数。",
+                    "entries": exceeded,
+                }
+            )
+
+    if issues:
+        raise supplement_validation_error(issues)
+
+    # 4) 整批覆盖式写入（已登记的样组整体替换，未登记的新建）
+    now = utcnow()
+    statuses = {
+        item.group_id: (
+            "updated"
+            if db.execute(
+                "SELECT 1 FROM dl_supplements WHERE group_id = ?", (item.group_id,)
+            ).fetchone()
+            else "created"
+        )
+        for item in body.supplements
+    }
+    with db:
+        for item in body.supplements:
+            if statuses[item.group_id] == "updated":
+                db.execute(
+                    "UPDATE dl_supplements SET detected_reading_sum = ?, updated_at = ? "
+                    "WHERE group_id = ?",
+                    (item.detected_reading_sum, now, item.group_id),
+                )
+                db.execute(
+                    "DELETE FROM dl_supplement_non_detects WHERE group_id = ?",
+                    (item.group_id,),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO dl_supplements "
+                    "(group_id, detected_reading_sum, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (item.group_id, item.detected_reading_sum, now, now),
+                )
+            db.executemany(
+                "INSERT INTO dl_supplement_non_detects "
+                "(group_id, blank_id, detection_limit, nd_count) VALUES (?, ?, ?, ?)",
+                [
+                    (item.group_id, e.blank_id, e.detection_limit, e.count)
+                    for e in sorted(
+                        item.non_detects, key=lambda e: (e.blank_id, e.detection_limit)
+                    )
+                ],
+            )
+
+    return {
+        "supplements": [
+            supplement_payload(db, item.group_id, status=statuses[item.group_id])
+            for item in body.supplements
+        ]
+    }
+
+
+@app.get(
+    "/detection-limit/supplements/{group_id}",
+    tags=["detection-limit"],
+    summary="查询单样组的检出限补录",
+)
+def get_supplement(group_id: str, db: Db) -> dict[str, Any]:
+    payload = supplement_payload(db, group_id)
+    if payload is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "supplement_not_found",
+                "message": f"样组 {group_id} 尚无检出限补录。",
+            },
+        )
+    return payload
+
+
+@app.get(
+    "/detection-limit/supplements",
+    tags=["detection-limit"],
+    summary="列出全部检出限补录",
+)
+def list_supplements(db: Db) -> list[dict[str, Any]]:
+    ids = [
+        r["group_id"]
+        for r in db.execute(
+            "SELECT group_id FROM dl_supplements ORDER BY group_id"
+        )
+    ]
+    return [supplement_payload(db, g) for g in ids]
+
+
+# ================================================================ 检出限复核
+
+@app.post("/reviews", status_code=201, tags=["detection-limit"], summary="发起检出限复核")
+def create_review(body: ReviewRequest, db: Db) -> dict[str, Any]:
+    """凭历史汇总号与同单位浓度限值发起复核。
+
+    - 沿用该汇总留档的空白扣减（summary_blanks 快照）；
+    - 以开始核算时已生效的补录为准：事务内读取，核算期间的整批更正不影响本次复核；
+    - 未检出读数按零至各自检出限计，求校正均值上下界并判定；
+    - 缺少补录时列出样组（404），本次不生成复核记录。
+    """
+    summary = db.execute(
+        "SELECT * FROM summaries WHERE summary_id = ?", (body.summary_id,)
+    ).fetchone()
+    if summary is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "summary_not_found",
+                "message": f"汇总 {body.summary_id} 不存在。",
+            },
+        )
+
+    # 显式开启事务：核算期间读取到的全部补录构成一致性快照
+    db.execute("BEGIN")
+    try:
+        group_ids = [
+            r["group_id"]
+            for r in db.execute(
+                "SELECT group_id FROM summary_groups WHERE summary_id = ? ORDER BY group_id",
+                (body.summary_id,),
+            )
+        ]
+
+        missing_group_ids = [
+            g
+            for g in group_ids
+            if db.execute(
+                "SELECT 1 FROM dl_supplements WHERE group_id = ?", (g,)
+            ).fetchone()
+            is None
+        ]
+        if missing_group_ids:
+            db.execute("ROLLBACK")
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "missing_data",
+                    "message": "样组缺少检出限补录，本次不生成复核记录。",
+                    "missing": {"group_ids": missing_group_ids},
+                },
+            )
+
+        # 快照读取每个样组的补录
+        snapshot_groups: list[dict[str, Any]] = []
+        detected_parts: list[float] = []
+        nd_high_parts: list[float] = []
+        for g in group_ids:
+            sup = db.execute(
+                "SELECT * FROM dl_supplements WHERE group_id = ?", (g,)
+            ).fetchone()
+            nd_rows = db.execute(
+                "SELECT blank_id, detection_limit, nd_count "
+                "FROM dl_supplement_non_detects "
+                "WHERE group_id = ? ORDER BY blank_id, detection_limit",
+                (g,),
+            ).fetchall()
+            nd_high = math.fsum(
+                r["nd_count"] * r["detection_limit"] for r in nd_rows
+            )
+            snapshot_groups.append(
+                {
+                    "group_id": g,
+                    "detected_reading_sum": sup["detected_reading_sum"],
+                    "non_detects": [
+                        {
+                            "blank_id": r["blank_id"],
+                            "detection_limit": r["detection_limit"],
+                            "count": r["nd_count"],
+                        }
+                        for r in nd_rows
+                    ],
+                    "non_detect_sum_low": 0.0,
+                    "non_detect_sum_high": nd_high,
+                }
+            )
+            detected_parts.append(sup["detected_reading_sum"])
+            nd_high_parts.append(nd_high)
+
+        # 沿用历史汇总留档的空白扣减快照
+        blank_rows = db.execute(
+            "SELECT blank_id, usage_count, deduction "
+            "FROM summary_blanks WHERE summary_id = ? ORDER BY blank_id",
+            (body.summary_id,),
+        ).fetchall()
+
+        total_measurements = summary["total_measurements"]
+        detected_reading_sum = math.fsum(detected_parts)
+        non_detect_sum_low = 0.0
+        non_detect_sum_high = math.fsum(nd_high_parts)
+        blank_deduction_total = math.fsum(
+            r["deduction"] * r["usage_count"] for r in blank_rows
+        )
+
+        # 未检出读数按零至各自检出限计 → 校正均值上下界
+        corrected_mean_lower = (
+            detected_reading_sum + non_detect_sum_low - blank_deduction_total
+        ) / total_measurements
+        corrected_mean_upper = (
+            detected_reading_sum + non_detect_sum_high - blank_deduction_total
+        ) / total_measurements
+
+        limit = body.concentration_limit
+        if corrected_mean_lower > limit:
+            determination = DETERMINATION_EXCEED
+        elif corrected_mean_upper <= limit:
+            determination = DETERMINATION_NOT_EXCEED
+        else:
+            determination = DETERMINATION_INDETERMINATE
+
+        now = utcnow()
+        cur = db.execute(
+            "INSERT INTO reviews "
+            "(summary_id, analyte, unit, concentration_limit, total_measurements, "
+            " detected_reading_sum, non_detect_sum_low, non_detect_sum_high, "
+            " blank_deduction_total, corrected_mean_lower, corrected_mean_upper, "
+            " determination, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                body.summary_id,
+                summary["analyte"],
+                summary["unit"],
+                limit,
+                total_measurements,
+                detected_reading_sum,
+                non_detect_sum_low,
+                non_detect_sum_high,
+                blank_deduction_total,
+                corrected_mean_lower,
+                corrected_mean_upper,
+                determination,
+                now,
+            ),
+        )
+        review_id = cur.lastrowid
+        db.executemany(
+            "INSERT INTO review_groups "
+            "(review_id, group_id, detected_reading_sum, non_detect_sum_low, non_detect_sum_high) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    review_id,
+                    g["group_id"],
+                    g["detected_reading_sum"],
+                    g["non_detect_sum_low"],
+                    g["non_detect_sum_high"],
+                )
+                for g in snapshot_groups
+            ],
+        )
+        db.executemany(
+            "INSERT INTO review_non_detects "
+            "(review_id, group_id, blank_id, detection_limit, nd_count) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (review_id, g["group_id"], nd["blank_id"], nd["detection_limit"], nd["count"])
+                for g in snapshot_groups
+                for nd in g["non_detects"]
+            ],
+        )
+        db.executemany(
+            "INSERT INTO review_blanks (review_id, blank_id, usage_count, deduction) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (review_id, r["blank_id"], r["usage_count"], r["deduction"])
+                for r in blank_rows
+            ],
+        )
+        db.execute("COMMIT")
+    except HTTPException:
+        raise
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+    return review_payload(db, review_id)
+
+
+@app.get("/reviews/{review_id}", tags=["detection-limit"], summary="凭复核号查回原上下界、判定与核算依据")
+def get_review(review_id: int, db: Db) -> dict[str, Any]:
+    payload = review_payload(db, review_id)
+    if payload is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "review_not_found", "message": f"复核 {review_id} 不存在。"},
+        )
+    return payload
+
+
+@app.get("/reviews", tags=["detection-limit"], summary="列出全部复核记录")
+def list_reviews(db: Db) -> list[dict[str, Any]]:
+    ids = [
+        r["review_id"]
+        for r in db.execute("SELECT review_id FROM reviews ORDER BY review_id")
+    ]
+    return [review_payload(db, r) for r in ids]

@@ -191,6 +191,192 @@ def run():
     check(len(client.get("/groups").json()) == 5, "list groups")
     check(len(client.get("/blanks").json()) == 2, "list blanks")
 
+    # ============================================================
+    # 检出限复核：补录 / 整批更正 / 上下界判定 / 快照留档
+    # ============================================================
+    # 基线：汇总 1 = G1(B1×10) + G2(B1×5,B2×5)，N=20
+    # 汇总 1 留档空白扣减：B1=2.0（旧值快照）, B2=1.0 → 扣减合计 35
+    # 补录设计：
+    #   G1: 检出和 80；B1 未检出 2 次（检出限 3），其余 B1 8 次填 0
+    #   G2: 检出和 40；B1 未检出 3 次（检出限 4），B2 未检出 1 次（检出限 2），其余填 0
+    # 检出和合计 120；未检出高值 = 2*3 + 3*4 + 1*2 = 20；扣减 35
+    # 下界 = (120 - 35)/20 = 4.25，上界 = (120 + 20 - 35)/20 = 5.25
+
+    # ---- 缺少补录时发起复核：列出样组，不生成复核记录 ----
+    reviews_before = len(client.get("/reviews").json())
+    r = client.post("/reviews", json={"summary_id": 1, "concentration_limit": 5.0})
+    check(r.status_code == 404, f"review without supplements -> 404: {r.text}")
+    check(r.json()["detail"]["missing"] == {"group_ids": ["G1", "G2"]},
+          "missing supplements list groups")
+    check(len(client.get("/reviews").json()) == reviews_before, "no review created")
+
+    # ---- 整批校验失败（多类问题一次列出，整批不生效）----
+    bad_batch = {"supplements": [
+        # 未覆盖 G1 使用的全部空白（G1 只用 B1，这里又报了未使用的 B2），且 B1 超用量
+        {"group_id": "G1", "detected_reading_sum": 80.0, "non_detects": [
+            {"blank_id": "B1", "detection_limit": 3.0, "count": 11},
+            {"blank_id": "B2", "detection_limit": 2.0, "count": 0}]},
+        # G2 漏报 B2
+        {"group_id": "G2", "detected_reading_sum": 40.0, "non_detects": [
+            {"blank_id": "B1", "detection_limit": 4.0, "count": 3}]},
+    ]}
+    r = client.put("/detection-limit/supplements", json=bad_batch)
+    check(r.status_code == 422, f"invalid batch -> 422: {r.text}")
+    reasons = {(i["group_id"], i["reason"]) for i in r.json()["detail"]["issues"]}
+    check(("G1", "non_detect_count_exceeds_usage") in reasons, "G1 over usage reported")
+    check(("G1", "blank_not_used_by_group") in reasons, "G1 unknown blank reported")
+    check(("G2", "blank_missing_from_report") in reasons, "G2 uncovered blank reported")
+    check(client.get("/detection-limit/supplements/G1").status_code == 404,
+          "atomic batch: nothing written on validation failure")
+
+    # ---- 未知样组：404 列出编号 ----
+    r = client.put("/detection-limit/supplements", json={"supplements": [
+        {"group_id": "GX", "detected_reading_sum": 1.0, "non_detects": [
+            {"blank_id": "B1", "detection_limit": 1.0, "count": 0}]}]})
+    check(r.status_code == 404 and r.json()["detail"]["missing"] == {"group_ids": ["GX"]},
+          "unknown group in supplement batch -> 404")
+
+    # ---- 批内样组重复 / 同 (空白, 检出限) 重复填报 ----
+    r = client.put("/detection-limit/supplements", json={"supplements": [
+        {"group_id": "G1", "detected_reading_sum": 1.0, "non_detects": [
+            {"blank_id": "B1", "detection_limit": 1.0, "count": 0}]},
+        {"group_id": "G1", "detected_reading_sum": 2.0, "non_detects": [
+            {"blank_id": "B1", "detection_limit": 1.0, "count": 0}]}]})
+    check(r.status_code == 422 and r.json()["detail"]["issues"][0]["reason"]
+          == "duplicate_group_in_batch", "duplicate group in batch -> 422")
+    r = client.put("/detection-limit/supplements", json={"supplements": [
+        {"group_id": "G1", "detected_reading_sum": 80.0, "non_detects": [
+            {"blank_id": "B1", "detection_limit": 3.0, "count": 1},
+            {"blank_id": "B1", "detection_limit": 3.0, "count": 1}]}]})
+    check(r.status_code == 422 and r.json()["detail"]["issues"][0]["reason"]
+          == "duplicate_non_detect_entry", "duplicate non-detect entry -> 422")
+
+    # ---- 入参校验：检出限非正、负数次数、空批次 / 空未检出清单 -> 422 ----
+    r = client.put("/detection-limit/supplements", json={"supplements": [
+        {"group_id": "G1", "detected_reading_sum": 80.0, "non_detects": [
+            {"blank_id": "B1", "detection_limit": 0.0, "count": 0}]}]})
+    check(r.status_code == 422, "non-positive detection limit -> 422")
+    r = client.put("/detection-limit/supplements", json={"supplements": [
+        {"group_id": "G1", "detected_reading_sum": 80.0, "non_detects": [
+            {"blank_id": "B1", "detection_limit": 3.0, "count": -1}]}]})
+    check(r.status_code == 422, "negative count -> 422")
+    r = client.put("/detection-limit/supplements", json={"supplements": []})
+    check(r.status_code == 422, "empty batch -> 422")
+    r = client.put("/detection-limit/supplements", json={"supplements": [
+        {"group_id": "G1", "detected_reading_sum": 80.0, "non_detects": []}]})
+    check(r.status_code == 422, "empty non_detects -> 422")
+
+    # ---- 合法整批补录（零未检出也明确填报）----
+    good_batch = {"supplements": [
+        {"group_id": "G1", "detected_reading_sum": 80.0, "non_detects": [
+            {"blank_id": "B1", "detection_limit": 3.0, "count": 2},
+            {"blank_id": "B1", "detection_limit": 1.0, "count": 0}]},
+        {"group_id": "G2", "detected_reading_sum": 40.0, "non_detects": [
+            {"blank_id": "B1", "detection_limit": 4.0, "count": 3},
+            {"blank_id": "B2", "detection_limit": 2.0, "count": 1},
+            {"blank_id": "B2", "detection_limit": 1.0, "count": 0}]}]}
+    r = client.put("/detection-limit/supplements", json=good_batch)
+    check(r.status_code == 200, f"create supplements: {r.text}")
+    statuses = {s["group_id"]: s["status"] for s in r.json()["supplements"]}
+    check(statuses == {"G1": "created", "G2": "created"}, "first batch status=created")
+    r = client.get("/detection-limit/supplements/G1")
+    check(r.status_code == 200, "get supplement")
+    g1_sup = r.json()
+    check(approx(g1_sup["detected_reading_sum"], 80.0), "supplement detected sum stored")
+    check([(e["blank_id"], e["detection_limit"], e["count"]) for e in g1_sup["non_detects"]]
+          == [("B1", 1.0, 0), ("B1", 3.0, 2)], "zero non-detect explicitly stored & sorted")
+    check(len(client.get("/detection-limit/supplements").json()) == 2, "list supplements")
+
+    # ---- 复核判定：下界 4.25、上界 5.25 ----
+    # 限值 4.0 < 下界 → 超限
+    r = client.post("/reviews", json={"summary_id": 1, "concentration_limit": 4.0})
+    check(r.status_code == 201, f"create review exceed: {r.text}")
+    rv = r.json()
+    check(rv["determination"] == "exceed", "lower > limit -> exceed")
+    check(approx(rv["corrected_mean_lower"], 4.25), "review lower bound")
+    check(approx(rv["corrected_mean_upper"], 5.25), "review upper bound")
+    check(approx(rv["detected_reading_sum"], 120.0), "review detected total")
+    check(approx(rv["non_detect_sum_high"], 20.0) and approx(rv["non_detect_sum_low"], 0.0),
+          "review non-detect sums")
+    # 沿用汇总 1 留档的空白扣减（B1=2.0 旧值，而非当前 4.0）
+    check(approx(rv["blank_deduction_total"], 35.0), "review uses archived blank deduction")
+    rb = {b["blank_id"]: b for b in rv["blanks"]}
+    check(approx(rb["B1"]["deduction"], 2.0) and rb["B1"]["usage_count"] == 15,
+          "review blank snapshot from summary")
+    check(rv["total_measurements"] == 20 and rv["unit"] == "ug/L", "review N and unit")
+    review_id = rv["review_id"]
+
+    # 限值 6.0 >= 上界 → 未超限
+    r = client.post("/reviews", json={"summary_id": 1, "concentration_limit": 6.0})
+    check(r.status_code == 201 and r.json()["determination"] == "not_exceed",
+          "upper <= limit -> not_exceed")
+
+    # 限值 5.0 落在区间内（4.25 <= 5.0 < 5.25）→ 无法判定
+    r = client.post("/reviews", json={"summary_id": 1, "concentration_limit": 5.0})
+    check(r.status_code == 201 and r.json()["determination"] == "indeterminate",
+          "limit inside interval -> indeterminate")
+
+    # 边界：限值 = 上界 5.25，上界不高于限值 → 未超限
+    r = client.post("/reviews", json={"summary_id": 1, "concentration_limit": 5.25})
+    check(r.json()["determination"] == "not_exceed", "limit == upper -> not_exceed")
+    # 边界：限值 = 下界 4.25，下界不高于限值 → 无法判定
+    r = client.post("/reviews", json={"summary_id": 1, "concentration_limit": 4.25})
+    check(r.json()["determination"] == "indeterminate", "limit == lower -> indeterminate")
+
+    # ---- 凭复核号查回原上下界、判定与核算依据 ----
+    r = client.get(f"/reviews/{review_id}")
+    check(r.status_code == 200, "get review by id")
+    got = r.json()
+    check(got["determination"] == "exceed"
+          and approx(got["corrected_mean_lower"], 4.25)
+          and approx(got["corrected_mean_upper"], 5.25), "review stored bounds & determination")
+    rg = {g["group_id"]: g for g in got["groups"]}
+    check(approx(rg["G1"]["non_detect_sum_high"], 6.0), "G1 basis nd high = 2*3")
+    check(approx(rg["G2"]["non_detect_sum_high"], 14.0), "G2 basis nd high = 3*4+1*2")
+    check([(e["blank_id"], e["detection_limit"], e["count"]) for e in rg["G2"]["non_detects"]]
+          == [("B1", 4.0, 3), ("B2", 1.0, 0), ("B2", 2.0, 1)], "G2 non-detect basis snapshotted")
+    check(client.get("/reviews/999").status_code == 404, "missing review -> 404")
+    check(client.post("/reviews", json={"summary_id": 999, "concentration_limit": 1.0}).status_code
+          == 404, "review unknown summary -> 404")
+
+    # ---- 整批更正：复核以开始核算时已生效的补录为准，旧复核不变 ----
+    corrected_batch = {"supplements": [
+        {"group_id": "G1", "detected_reading_sum": 70.0, "non_detects": [
+            {"blank_id": "B1", "detection_limit": 3.0, "count": 1}]},
+        {"group_id": "G2", "detected_reading_sum": 40.0, "non_detects": [
+            {"blank_id": "B1", "detection_limit": 4.0, "count": 3},
+            {"blank_id": "B2", "detection_limit": 2.0, "count": 1},
+            {"blank_id": "B2", "detection_limit": 1.0, "count": 0}]}]}
+    r = client.put("/detection-limit/supplements", json=corrected_batch)
+    check(r.status_code == 200, "corrected batch accepted")
+    statuses = {s["group_id"]: s["status"] for s in r.json()["supplements"]}
+    check(statuses == {"G1": "updated", "G2": "updated"}, "second batch status=updated")
+    # 覆盖式替换：G1 旧条目（检出限 1.0 的 0 次条目）已删除
+    g1_now = client.get("/detection-limit/supplements/G1").json()
+    check(approx(g1_now["detected_reading_sum"], 70.0), "G1 detected sum replaced")
+    check([(e["detection_limit"], e["count"]) for e in g1_now["non_detects"]]
+          == [(3.0, 1)], "G1 non-detects fully replaced")
+
+    # 旧复核记录原样保留（核算依据快照）
+    old_review = client.get(f"/reviews/{review_id}").json()
+    check(approx(old_review["detected_reading_sum"], 120.0)
+          and old_review["determination"] == "exceed", "old review unaffected by correction")
+    old_g1 = {g["group_id"]: g for g in old_review["groups"]}["G1"]
+    check(approx(old_g1["detected_reading_sum"], 80.0)
+          and approx(old_g1["non_detect_sum_high"], 6.0), "old review group basis retained")
+
+    # 新复核按更正后的补录：检出和 110，未检出高值 = 1*3 + 3*4 + 1*2 = 17
+    # 下界 = (110-35)/20 = 3.75，上界 = (110+17-35)/20 = 4.6
+    r = client.post("/reviews", json={"summary_id": 1, "concentration_limit": 5.0})
+    check(r.status_code == 201, f"review after correction: {r.text}")
+    rv2 = r.json()
+    check(approx(rv2["corrected_mean_lower"], 3.75), "new review lower after correction")
+    check(approx(rv2["corrected_mean_upper"], 4.6), "new review upper after correction")
+    check(rv2["determination"] == "not_exceed", "corrected data -> not_exceed at limit 5")
+    check(approx(rv2["blank_deduction_total"], 35.0), "still uses archived deduction")
+    # 成功创建的复核共 6 条：超限、未超限、无法判定、两个边界判定、更正后各 1 条
+    check(len(client.get("/reviews").json()) == reviews_before + 6, "all reviews retained")
+
     print("ALL TESTS PASSED")
 
 

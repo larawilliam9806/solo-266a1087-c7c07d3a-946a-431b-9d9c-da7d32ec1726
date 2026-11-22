@@ -1,0 +1,9 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.db
+data/
+tests/
+README.md
+requirements-dev.txt
